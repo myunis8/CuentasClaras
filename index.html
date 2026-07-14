@@ -198,7 +198,7 @@ footer.note{margin-top:36px;font-size:12px;color:var(--ink-soft);text-align:cent
 <script>
 /* ===================== ESTADO Y PERSISTENCIA ===================== */
 const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
-const STORAGE_KEYS = ['config','rentByMonth','servicesByMonth','cleaning','groceries','cardInstallments','cardAutodebits','monthlyExpenses','exchangeRates','settlements','cardCharges'];
+const STORAGE_KEYS = ['config','rentByMonth','servicesByMonth','cleaning','groceries','cardInstallments','cardAutodebits','monthlyExpenses','exchangeRates','settlements','cardCharges','actualDebits'];
 const SERVICIOS_PREDEFINIDOS = ['Luz','Agua','Gas','Internet','Otro'];
 const CATEGORIAS_MENSUALES = ['Verdulería','Lavadero','Supermercado (compra chica)','Pedidos de comida','Eventual','Otro'];
 
@@ -213,7 +213,8 @@ let state = {
   monthlyExpenses: [],
   exchangeRates: {}, // { 'YYYY-MM': {value, updatedAt, deleted?} }
   settlements: [], // [{id, date, amount, direction, note, updatedAt, deleted?}]
-  cardCharges: [] // consumos sueltos importados de un resumen (no son cuotas): {id, date, description, amount, paidBy, responsibility, updatedAt, deleted?}
+  cardCharges: [] // consumos sueltos importados de un resumen (no son cuotas): {id, date, description, amount, currency, nativeAmount, paidBy, responsibility, updatedAt, deleted?}
+  , actualDebits: {} // { 'YYYY-MM': {amount, updatedAt, deleted?} } — lo que realmente te debitaron de la cuenta ese mes
 };
 
 let currentMonth = new Date().toISOString().slice(0,7);
@@ -345,7 +346,8 @@ function mergeState(remote, local){
     monthlyExpenses: mergeById(remote.monthlyExpenses, local.monthlyExpenses),
     exchangeRates: mergeMapWithUpdatedAt(remote.exchangeRates, local.exchangeRates),
     settlements: mergeById(remote.settlements, local.settlements),
-    cardCharges: mergeById(remote.cardCharges, local.cardCharges)
+    cardCharges: mergeById(remote.cardCharges, local.cardCharges),
+    actualDebits: mergeMapWithUpdatedAt(remote.actualDebits, local.actualDebits)
   };
 }
 
@@ -652,6 +654,11 @@ function findMatchingInstallment(cleanDesc, numInstallments, targetMonth, cuotaI
     return months[cuotaIdx-1]===targetMonth;
   });
 }
+// Busca un débito automático ya cargado con el mismo concepto (por si se reimporta el resumen
+// de un mes posterior con un consumo marcado como recurrente).
+function findMatchingAutodebit(description){
+  return state.cardAutodebits.find(a=> !a.deleted && normalizeDesc(a.description)===normalizeDesc(description));
+}
 
 /* ===================== COTIZACIÓN USD ===================== */
 function getRateForMonth(monthKey){
@@ -714,6 +721,18 @@ function nativeCardAmountsForMonth(monthKey){
     const period = currentPeriodFor(a.periods, monthKey);
     if(!period) return;
     if((period.currency||'ARS')==='USD') sumUsd += Number(period.amount); else sumArs += Number(period.amount);
+  });
+  return { sumArs, sumUsd };
+}
+// Igual que nativeCardAmountsForMonth, pero sumando también los cargos sueltos ya importados
+// (para poder calcular la cotización real a partir de "cuánto me debitaron" en cualquier momento,
+// no solo durante la importación).
+function knownCardAmountsForMonth(monthKey){
+  const base = nativeCardAmountsForMonth(monthKey);
+  let sumArs = base.sumArs, sumUsd = base.sumUsd;
+  (state.cardCharges||[]).filter(c=>!c.deleted && c.date.slice(0,7)===monthKey).forEach(c=>{
+    if(c.currency==='USD') sumUsd += Number(c.nativeAmount||0);
+    else sumArs += Number(c.amount||0);
   });
   return { sumArs, sumUsd };
 }
@@ -1486,6 +1505,9 @@ function renderTarjeta(){
   const importedItems = (state.cardCharges||[]).filter(c=>!c.deleted && c.date.slice(0,7)===currentMonth);
   const importedTotal = importedItems.reduce((a,m)=>a+Number(m.amount),0);
   const monthTotal = monthItems.reduce((a,i)=>a+i.arsAmt,0) + importedTotal;
+  const usdTotal = knownCardAmountsForMonth(currentMonth).sumUsd;
+  const currentRate = getRateForMonth(currentMonth);
+  const actualDebit = (state.actualDebits[currentMonth] && !state.actualDebits[currentMonth].deleted) ? state.actualDebits[currentMonth] : null;
 
   const forecastMonths = Array.from({length:6},(_,i)=> addMonths(currentMonth,i));
   const rows = [];
@@ -1521,8 +1543,17 @@ function renderTarjeta(){
 
     <div class="card" style="margin-bottom:20px;">
       <h3>Vas a pagar en ${formatMonth(currentMonth)}</h3>
-      <div class="stat-val" style="font-size:22px;">${formatMoney(monthTotal)}</div>
+      <div class="sub-stats" style="border-top:none;padding-top:0;margin-top:0;">
+        <div class="stat"><div class="stat-label">Estimado en pesos</div><div class="stat-val" style="font-size:22px;">${formatMoney(monthTotal)}</div></div>
+        ${usdTotal>0 ? `<div class="stat"><div class="stat-label">De eso, en dólares</div><div class="stat-val" style="font-size:22px;">${formatUsd(usdTotal)}</div></div>` : ''}
+        <div class="stat"><div class="stat-label">Cotización usada</div><div class="stat-val">${currentRate ? `$${currentRate.rate.toFixed(2)}${currentRate.estimated?' (estimada)':''}` : '— sin cargar'}</div></div>
+      </div>
       ${hasUnknownRate ? `<span class="tag warn" style="margin-top:8px;">Hay consumos en USD sin cotización cargada — el monto puede subestimarse</span>` : ''}
+      <div class="form-row" style="margin-top:16px;border-top:1px dashed var(--line);padding-top:14px;">
+        <div class="field"><label>Monto que realmente te debitaron (ARS)</label><input type="number" min="0" step="0.01" id="actual-debit" value="${actualDebit?actualDebit.amount:''}" placeholder="Ej: 350000"></div>
+        <div class="field small"><button class="btn" id="actual-debit-save">Guardar${usdTotal>0?' y calcular cotización':''}</button></div>
+      </div>
+      <p class="section-hint" style="margin-top:6px;">Cargalo cuando veas el movimiento real en tu cuenta — si hay consumos en dólares ese mes, la cotización se calcula sola a partir de la diferencia.</p>
     </div>
 
     <div class="table-wrap">
@@ -1598,12 +1629,11 @@ function renderTarjeta(){
         <div style="margin-top:16px;border-top:1px dashed var(--line);padding-top:14px;">
           <div class="form-row">
             <div class="field"><label>Mes del resumen</label><button type="button" class="btn secondary" id="stmt-month-btn">${formatMonth(stmtMonthSelected)} ▾</button></div>
-            <div class="field"><label>Total debitado de la cuenta (ARS)</label><input type="number" min="0" step="0.01" id="stmt-total" value="${stmtTotalDebited}" placeholder="Ej: 350000"></div>
           </div>
-          <p class="section-hint" style="margin-top:10px;">Marcá "Es cuota" en los consumos financiados y completá nº de cuota / total de cuotas — así se proyectan solas a los meses siguientes en vez de quedar como un cargo suelto.</p>
+          <p class="section-hint" style="margin-top:10px;">Marcá <strong>"Es cuota"</strong> en los consumos financiados (con nº de cuota / total) para que se proyecten a los meses siguientes. Marcá <strong>"Recurrente"</strong> en cosas como seguros o suscripciones — el mes que viene se va a seguir estimando con este mismo valor hasta que lo actualices.</p>
           <div class="table-wrap" style="margin-top:6px;">
             <table>
-              <thead><tr><th>Incluir</th><th>Descripción</th><th>Pesos</th><th>Dólares</th><th>Es cuota</th><th>Nº / Total</th><th>Tipo</th></tr></thead>
+              <thead><tr><th>Incluir</th><th>Descripción</th><th>Pesos</th><th>Dólares</th><th>Es cuota</th><th>Nº / Total</th><th>Recurrente</th><th>Tipo</th></tr></thead>
               <tbody>
                 ${stmtItems.map((it,idx)=>`
                   <tr>
@@ -1617,6 +1647,7 @@ function renderTarjeta(){
                       /
                       <input type="number" min="1" step="1" data-stmt-cuotatotal="${idx}" value="${it.cuotaTotal||''}" placeholder="Tot" style="width:50px;">
                     </td>
+                    <td style="text-align:center;"><input type="checkbox" data-stmt-recurring="${idx}" ${it.isRecurring?'checked':''}></td>
                     <td>${typeSelect('stmt-type-'+idx, it.type||'compartido')}</td>
                   </tr>`).join('')}
               </tbody>
@@ -1624,12 +1655,12 @@ function renderTarjeta(){
                 <td colspan="2"><strong>Total (para chequear contra el resumen)</strong></td>
                 <td><strong id="stmt-total-ars-preview"></strong></td>
                 <td><strong id="stmt-total-usd-preview"></strong></td>
-                <td colspan="3"></td>
+                <td colspan="4"></td>
               </tr></tfoot>
             </table>
           </div>
           <div class="form-row" style="margin-top:12px;">
-            <button class="btn" id="stmt-confirm">Calcular cotización e importar</button>
+            <button class="btn" id="stmt-confirm">Importar</button>
             <button class="btn ghost" id="stmt-cancel">Descartar</button>
           </div>
         </div>
@@ -1718,6 +1749,29 @@ function renderTarjeta(){
     </div>
   `;
 
+  // monto real debitado -> guarda y (si hay dólares ese mes) calcula la cotización sola
+  document.getElementById('actual-debit-save').onclick = ()=>{
+    const val = parseFloat(document.getElementById('actual-debit').value);
+    if(!val || val<=0){ showToast('Ingresá un monto válido.'); return; }
+    state.actualDebits[currentMonth] = { amount: val, updatedAt: now() };
+    saveKey('actualDebits');
+    const known = knownCardAmountsForMonth(currentMonth);
+    if(known.sumUsd>0){
+      const computed = (val - known.sumArs) / known.sumUsd;
+      if(computed>0){
+        const rate = Math.round(computed*100)/100;
+        state.exchangeRates[currentMonth] = { value: rate, updatedAt: now() };
+        saveKey('exchangeRates');
+        showToast(`Guardado. Cotización calculada: $${rate}`);
+      } else {
+        showToast('Guardado, pero el monto no alcanza a cubrir los consumos en pesos conocidos — revisá los datos.');
+      }
+    } else {
+      showToast('Guardado.');
+    }
+    renderTarjeta();
+  };
+
   // cotización
   document.getElementById('rate-month-btn').onclick = (e)=>{
     openMonthPicker(e.currentTarget, rateMonthSelected, (key)=>{
@@ -1784,10 +1838,10 @@ function renderTarjeta(){
         description: cuota ? cuota.cleanDesc : it.description,
         isCuota: !!cuota,
         cuotaIdx: cuota ? cuota.idx : '',
-        cuotaTotal: cuota ? cuota.total : ''
+        cuotaTotal: cuota ? cuota.total : '',
+        isRecurring: false
       };
     });
-    if(!stmtTotalDebited) stmtTotalDebited = '';
     showToast(`Se cargaron ${items.length} conceptos${skipped.length ? ` (se ignoraron ${skipped.length} líneas sin formato reconocido)` : ''}. Revisalos antes de importar.`);
     renderTarjeta();
   };
@@ -1801,7 +1855,6 @@ function renderTarjeta(){
 
   const stmtConfirm = document.getElementById('stmt-confirm');
   if(stmtConfirm) stmtConfirm.onclick = ()=>{
-    const stmtTotalVal = parseFloat(document.getElementById('stmt-total').value) || 0;
     const checked = [];
     stmtItems.forEach((it,idx)=>{
       const chk = document.querySelector(`[data-stmt-check="${idx}"]`);
@@ -1815,45 +1868,49 @@ function renderTarjeta(){
       const isCuota = document.querySelector(`[data-stmt-iscuota="${idx}"]`).checked;
       const cuotaIdx = parseInt(document.querySelector(`[data-stmt-cuotaidx="${idx}"]`).value) || 0;
       const cuotaTotal = parseInt(document.querySelector(`[data-stmt-cuotatotal="${idx}"]`).value) || 0;
-      if(amount>0) checked.push({ description, amount, currency, type, isCuota, cuotaIdx, cuotaTotal });
+      const isRecurring = document.querySelector(`[data-stmt-recurring="${idx}"]`).checked;
+      if(amount>0) checked.push({ description, amount, currency, type, isCuota, cuotaIdx, cuotaTotal, isRecurring });
     });
     if(!checked.length){ showToast('Marcá al menos un concepto para importar (con un monto en pesos o dólares).'); return; }
 
-    const sumArsExtracted = checked.filter(i=>i.currency==='ARS').reduce((a,i)=>a+i.amount,0);
-    const sumUsdExtracted = checked.filter(i=>i.currency==='USD').reduce((a,i)=>a+i.amount,0);
-    const existing = nativeCardAmountsForMonth(stmtMonthSelected);
-    const totalArsKnown = sumArsExtracted + existing.sumArs;
-    const totalUsdNative = sumUsdExtracted + existing.sumUsd;
+    const fallbackRate = getRateForMonth(stmtMonthSelected);
 
-    let rate = null;
-    if(stmtTotalVal>0 && totalUsdNative>0){
-      const computed = (stmtTotalVal - totalArsKnown) / totalUsdNative;
-      if(computed>0){
-        rate = Math.round(computed*100)/100;
-        state.exchangeRates[stmtMonthSelected] = { value: rate, updatedAt: now() };
-        saveKey('exchangeRates');
-      } else {
-        showToast('El total no alcanza a cubrir los montos en pesos conocidos — revisá los datos. Se importaron los conceptos sin actualizar la cotización.');
-      }
-    }
-    const fallbackRate = rate ? {rate, estimated:false} : getRateForMonth(stmtMonthSelected);
-
-    let newInstallments = 0, matchedInstallments = 0, charges = 0;
+    let newInstallments = 0, matchedInstallments = 0, newAutodebits = 0, updatedAutodebits = 0, charges = 0;
     checked.forEach(it=>{
       if(it.isCuota && it.cuotaIdx>=1 && it.cuotaTotal>=1 && it.cuotaIdx<=it.cuotaTotal){
-        const cleanDesc = it.description;
-        const existingCi = findMatchingInstallment(cleanDesc, it.cuotaTotal, stmtMonthSelected, it.cuotaIdx);
+        const existingCi = findMatchingInstallment(it.description, it.cuotaTotal, stmtMonthSelected, it.cuotaIdx);
         if(existingCi){
           matchedInstallments++; // ya estaba cargada por un resumen anterior: no se duplica
           return;
         }
         state.cardInstallments.push({
-          id: uid(), description: cleanDesc,
+          id: uid(), description: it.description,
           totalAmount: it.amount * it.cuotaTotal, numInstallments: it.cuotaTotal,
           startMonth: addMonths(stmtMonthSelected, -(it.cuotaIdx-1)),
           currency: it.currency, type: it.type, updatedAt: now()
         });
         newInstallments++;
+        return;
+      }
+      if(it.isRecurring){
+        const existingAd = findMatchingAutodebit(it.description);
+        if(existingAd){
+          const period = currentPeriodFor(existingAd.periods, stmtMonthSelected);
+          if(!period || Number(period.amount)!==it.amount || (period.currency||'ARS')!==it.currency){
+            existingAd.periods = existingAd.periods.filter(p=>p.startMonth!==stmtMonthSelected);
+            existingAd.periods.push({ startMonth: stmtMonthSelected, amount: it.amount, currency: it.currency });
+            existingAd.updatedAt = now();
+            updatedAutodebits++;
+          }
+          existingAd.active = true;
+        } else {
+          state.cardAutodebits.push({
+            id: uid(), description: it.description, type: it.type, active:true,
+            periods:[{ startMonth: stmtMonthSelected, amount: it.amount, currency: it.currency }],
+            updatedAt: now()
+          });
+          newAutodebits++;
+        }
         return;
       }
       let arsAmount;
@@ -1867,14 +1924,16 @@ function renderTarjeta(){
       charges++;
     });
     saveKey('cardInstallments');
+    saveKey('cardAutodebits');
     saveKey('cardCharges');
     let msg = [];
     if(newInstallments) msg.push(`${newInstallments} cuota(s) nueva(s)`);
-    if(matchedInstallments) msg.push(`${matchedInstallments} cuota(s) ya cargada(s) (no se duplicaron)`);
+    if(matchedInstallments) msg.push(`${matchedInstallments} cuota(s) ya cargada(s)`);
+    if(newAutodebits) msg.push(`${newAutodebits} recurrente(s) nuevo(s)`);
+    if(updatedAutodebits) msg.push(`${updatedAutodebits} recurrente(s) actualizado(s)`);
     if(charges) msg.push(`${charges} cargo(s) suelto(s)`);
-    showToast(`Importado: ${msg.join(', ')}${rate?` — cotización estimada: $${rate}`:''}.`);
+    showToast(`Importado: ${msg.join(', ')}.`);
     stmtItems = [];
-    stmtTotalDebited = '';
     if(stmtMonthSelected!==currentMonth) currentMonth = stmtMonthSelected;
     renderTarjeta();
   };
@@ -2272,7 +2331,7 @@ function renderConfig(){
 
   document.getElementById('cfg-reset').onclick = ()=>{
     if(!confirm('¿Seguro que querés borrar todos los datos? Esta acción no se puede deshacer.')) return;
-    state = { config: state.config, rentByMonth:{}, servicesByMonth:{}, cleaning:[], groceries:[], cardInstallments:[], cardAutodebits:[], monthlyExpenses:[], exchangeRates:{}, settlements:[], cardCharges:[] };
+    state = { config: state.config, rentByMonth:{}, servicesByMonth:{}, cleaning:[], groceries:[], cardInstallments:[], cardAutodebits:[], monthlyExpenses:[], exchangeRates:{}, settlements:[], cardCharges:[], actualDebits:{} };
     persistForce();
     showToast('Datos borrados.');
     render();
