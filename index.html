@@ -1427,8 +1427,10 @@ function renderTarjeta(){
   rateMonthSelected = currentMonth;
 
   const monthItems = cardItemsForMonth(currentMonth);
-  const monthTotal = monthItems.reduce((a,i)=>a+i.arsAmt,0);
   const hasUnknownRate = monthItems.some(i=>i.noRate);
+  const importedItems = state.monthlyExpenses.filter(m=>!m.deleted && m.category==='Tarjeta (resumen)' && m.date.slice(0,7)===currentMonth);
+  const importedTotal = importedItems.reduce((a,m)=>a+Number(m.amount),0);
+  const monthTotal = monthItems.reduce((a,i)=>a+i.arsAmt,0) + importedTotal;
 
   const forecastMonths = Array.from({length:6},(_,i)=> addMonths(currentMonth,i));
   const rows = [];
@@ -1466,6 +1468,23 @@ function renderTarjeta(){
       <h3>Vas a pagar en ${formatMonth(currentMonth)}</h3>
       <div class="stat-val" style="font-size:22px;">${formatMoney(monthTotal)}</div>
       ${hasUnknownRate ? `<span class="tag warn" style="margin-top:8px;">Hay consumos en USD sin cotización cargada — el monto puede subestimarse</span>` : ''}
+    </div>
+
+    <div class="table-wrap">
+      <h3 style="padding:12px 0 0 4px;font-family:var(--font-display);">Conceptos importados del resumen — ${formatMonth(currentMonth)}</h3>
+      <p class="section-hint" style="padding:0 4px;">Esto es lo que cargaste con "Importar resumen de tarjeta" más abajo. También podés editarlos desde la pestaña Gastos mensuales.</p>
+      <table>
+        <thead><tr><th>Descripción</th><th>Monto</th><th>Reparto</th><th></th></tr></thead>
+        <tbody>
+          ${importedItems.length ? importedItems.map(m=>`
+            <tr>
+              <td>${escapeHtml(m.description)}</td>
+              <td class="amt-cell">${formatMoney(m.amount)}</td>
+              <td><span class="tag ${respTagClass(m.responsibility)}">${respLabel(m.responsibility)}</span></td>
+              <td class="row-actions"><button class="btn danger-ghost" data-del-imported="${m.id}">Eliminar</button></td>
+            </tr>`).join('') : `<tr><td colspan="4" class="empty-note">Todavía no importaste ningún resumen para este mes.</td></tr>`}
+        </tbody>
+      </table>
     </div>
 
     <div class="table-wrap">
@@ -1723,6 +1742,15 @@ function renderTarjeta(){
     if(stmtMonthSelected!==currentMonth) currentMonth = stmtMonthSelected;
     renderTarjeta();
   };
+
+  el.querySelectorAll('[data-del-imported]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const item = state.monthlyExpenses.find(m=>m.id===btn.dataset.delImported);
+      if(item){ item.deleted = true; item.updatedAt = now(); }
+      saveKey('monthlyExpenses');
+      renderTarjeta();
+    };
+  });
 
   // cuotas
   document.getElementById('ci-start-btn').onclick = (e)=>{
