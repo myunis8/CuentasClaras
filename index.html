@@ -198,7 +198,7 @@ footer.note{margin-top:36px;font-size:12px;color:var(--ink-soft);text-align:cent
 <script>
 /* ===================== ESTADO Y PERSISTENCIA ===================== */
 const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
-const STORAGE_KEYS = ['config','rentByMonth','servicesByMonth','cleaning','groceries','cardInstallments','cardAutodebits','monthlyExpenses','exchangeRates','settlements'];
+const STORAGE_KEYS = ['config','rentByMonth','servicesByMonth','cleaning','groceries','cardInstallments','cardAutodebits','monthlyExpenses','exchangeRates','settlements','cardCharges'];
 const SERVICIOS_PREDEFINIDOS = ['Luz','Agua','Gas','Internet','Otro'];
 const CATEGORIAS_MENSUALES = ['Verdulería','Lavadero','Supermercado (compra chica)','Pedidos de comida','Eventual','Otro'];
 
@@ -212,7 +212,8 @@ let state = {
   cardAutodebits: [],
   monthlyExpenses: [],
   exchangeRates: {}, // { 'YYYY-MM': {value, updatedAt, deleted?} }
-  settlements: [] // [{id, date, amount, direction, note, updatedAt, deleted?}]
+  settlements: [], // [{id, date, amount, direction, note, updatedAt, deleted?}]
+  cardCharges: [] // consumos sueltos importados de un resumen (no son cuotas): {id, date, description, amount, paidBy, responsibility, updatedAt, deleted?}
 };
 
 let currentMonth = new Date().toISOString().slice(0,7);
@@ -343,7 +344,8 @@ function mergeState(remote, local){
     cardAutodebits: mergeById(remote.cardAutodebits, local.cardAutodebits),
     monthlyExpenses: mergeById(remote.monthlyExpenses, local.monthlyExpenses),
     exchangeRates: mergeMapWithUpdatedAt(remote.exchangeRates, local.exchangeRates),
-    settlements: mergeById(remote.settlements, local.settlements)
+    settlements: mergeById(remote.settlements, local.settlements),
+    cardCharges: mergeById(remote.cardCharges, local.cardCharges)
   };
 }
 
@@ -403,6 +405,7 @@ async function loadAll(){
   }
   migrateAutodebits();
   migrateExchangeRates();
+  migrateCardCharges();
 }
 function migrateAutodebits(){
   state.cardAutodebits = (state.cardAutodebits||[]).map(a=>{
@@ -417,6 +420,21 @@ function migrateExchangeRates(){
     out[k] = (v && typeof v==='object' && 'value' in v) ? v : { value:v, updatedAt: now() };
   });
   state.exchangeRates = out;
+}
+function migrateCardCharges(){
+  // Versiones anteriores importaban el resumen como "Gastos mensuales" (categoría "Tarjeta (resumen)").
+  // Los pasamos a su propia lista para que vivan solo en la pestaña Tarjeta.
+  if(!state.cardCharges) state.cardCharges = [];
+  (state.monthlyExpenses||[]).forEach(m=>{
+    if(m.category==='Tarjeta (resumen)' && !m.deleted){
+      if(!state.cardCharges.some(c=>c.id===m.id)){
+        state.cardCharges.push({ id:m.id, date:m.date, description:m.description, amount:m.amount,
+          paidBy:m.paidBy, responsibility:m.responsibility, updatedAt:m.updatedAt||now() });
+      }
+      m.deleted = true;
+      m.updatedAt = now();
+    }
+  });
 }
 
 const USE_NATIVE_STORAGE = (typeof window.storage !== 'undefined' && window.storage && typeof window.storage.get==='function');
@@ -603,6 +621,38 @@ function currentPeriodFor(periods, monthKey){
   return applicable;
 }
 
+/* ===================== DETECCIÓN DE CUOTAS AL IMPORTAR UN RESUMEN ===================== */
+// Reconoce formatos tipo "(cuota 3/6)", "(cuota 3 de 6)" o el propio del resumen "C.03/06".
+function parseCuotaInfo(description){
+  const patterns = [
+    /\(?\s*cuota\s*(\d+)\s*(?:\/|de)\s*(\d+)\s*\)?/i,
+    /\bC\.?\s*(\d{1,2})\s*\/\s*(\d{1,2})\b/i
+  ];
+  for(const re of patterns){
+    const m = description.match(re);
+    if(m){
+      const idx = parseInt(m[1],10), total = parseInt(m[2],10);
+      if(idx>=1 && total>=1 && idx<=total){
+        const cleanDesc = description.replace(re,'').replace(/\s{2,}/g,' ').trim().replace(/[-–—,]\s*$/,'').trim();
+        return { idx, total, cleanDesc: cleanDesc || description.trim() };
+      }
+    }
+  }
+  return null;
+}
+function normalizeDesc(s){ return String(s||'').toLowerCase().trim().replace(/\s+/g,' '); }
+// Busca una cuota ya cargada que corresponda al mismo concepto, para no duplicarla al reimportar
+// el resumen del mes siguiente.
+function findMatchingInstallment(cleanDesc, numInstallments, targetMonth, cuotaIdx){
+  return state.cardInstallments.find(ci=>{
+    if(ci.deleted) return false;
+    if(Number(ci.numInstallments)!==Number(numInstallments)) return false;
+    if(normalizeDesc(ci.description)!==normalizeDesc(cleanDesc)) return false;
+    const months = getInstallmentMonths(ci);
+    return months[cuotaIdx-1]===targetMonth;
+  });
+}
+
 /* ===================== COTIZACIÓN USD ===================== */
 function getRateForMonth(monthKey){
   const entry = state.exchangeRates[monthKey];
@@ -744,6 +794,10 @@ function getMonthItems(monthKey){
 
   state.monthlyExpenses.filter(m=>!m.deleted && m.date.slice(0,7)===monthKey).forEach(m=>{
     items.push({category:m.category||'Gastos mensuales', description:m.description, amount:m.amount, paidBy:m.paidBy, responsibility:m.responsibility});
+  });
+
+  (state.cardCharges||[]).filter(c=>!c.deleted && c.date.slice(0,7)===monthKey).forEach(c=>{
+    items.push({category:'Tarjeta (resumen)', description:c.description, amount:c.amount, paidBy:c.paidBy, responsibility:c.responsibility});
   });
 
   return items;
@@ -1425,10 +1479,11 @@ function renderTarjeta(){
   ciStartSelected = currentMonth;
   adPeriodMonthSelected = currentMonth;
   rateMonthSelected = currentMonth;
+  if(!stmtItems.length) stmtMonthSelected = currentMonth; // no tocar si hay una revisión de importación en curso
 
   const monthItems = cardItemsForMonth(currentMonth);
   const hasUnknownRate = monthItems.some(i=>i.noRate);
-  const importedItems = state.monthlyExpenses.filter(m=>!m.deleted && m.category==='Tarjeta (resumen)' && m.date.slice(0,7)===currentMonth);
+  const importedItems = (state.cardCharges||[]).filter(c=>!c.deleted && c.date.slice(0,7)===currentMonth);
   const importedTotal = importedItems.reduce((a,m)=>a+Number(m.amount),0);
   const monthTotal = monthItems.reduce((a,i)=>a+i.arsAmt,0) + importedTotal;
 
@@ -1471,8 +1526,8 @@ function renderTarjeta(){
     </div>
 
     <div class="table-wrap">
-      <h3 style="padding:12px 0 0 4px;font-family:var(--font-display);">Conceptos importados del resumen — ${formatMonth(currentMonth)}</h3>
-      <p class="section-hint" style="padding:0 4px;">Esto es lo que cargaste con "Importar resumen de tarjeta" más abajo. También podés editarlos desde la pestaña Gastos mensuales.</p>
+      <h3 style="padding:12px 0 0 4px;font-family:var(--font-display);">Cargos sueltos importados del resumen — ${formatMonth(currentMonth)}</h3>
+      <p class="section-hint" style="padding:0 4px;">Consumos e impuestos del resumen que no son cuotas. Las cuotas detectadas ("cuota X/Y") ya aparecen arriba, en la vista mensual, proyectadas a futuro.</p>
       <table>
         <thead><tr><th>Descripción</th><th>Monto</th><th>Reparto</th><th></th></tr></thead>
         <tbody>
@@ -1725,18 +1780,41 @@ function renderTarjeta(){
     }
     const fallbackRate = rate ? {rate, estimated:false} : getRateForMonth(stmtMonthSelected);
 
+    let newInstallments = 0, matchedInstallments = 0, charges = 0;
     checked.forEach(it=>{
+      const cuota = parseCuotaInfo(it.description);
+      if(cuota){
+        const existingCi = findMatchingInstallment(cuota.cleanDesc, cuota.total, stmtMonthSelected, cuota.idx);
+        if(existingCi){
+          matchedInstallments++; // ya estaba cargada por un resumen anterior: no se duplica
+          return;
+        }
+        state.cardInstallments.push({
+          id: uid(), description: cuota.cleanDesc,
+          totalAmount: it.amount * cuota.total, numInstallments: cuota.total,
+          startMonth: addMonths(stmtMonthSelected, -(cuota.idx-1)),
+          currency: it.currency, type: it.type, updatedAt: now()
+        });
+        newInstallments++;
+        return;
+      }
       let arsAmount;
       if(it.currency==='ARS') arsAmount = it.amount;
       else arsAmount = fallbackRate ? it.amount*fallbackRate.rate : 0;
       const desc = it.currency==='USD' ? `${it.description} (US$ ${it.amount.toLocaleString('es-AR')})` : it.description;
-      state.monthlyExpenses.push({
-        id:uid(), date:`${stmtMonthSelected}-01`, category:'Tarjeta (resumen)', description:desc,
+      state.cardCharges.push({
+        id:uid(), date:`${stmtMonthSelected}-01`, description:desc,
         amount:arsAmount, paidBy:'yo', responsibility: typeToResp(it.type), updatedAt: now()
       });
+      charges++;
     });
-    saveKey('monthlyExpenses');
-    showToast(`Se importaron ${checked.length} conceptos${rate?` — cotización estimada: $${rate}`:''}.`);
+    saveKey('cardInstallments');
+    saveKey('cardCharges');
+    let msg = [];
+    if(newInstallments) msg.push(`${newInstallments} cuota(s) nueva(s)`);
+    if(matchedInstallments) msg.push(`${matchedInstallments} cuota(s) ya cargada(s) (no se duplicaron)`);
+    if(charges) msg.push(`${charges} cargo(s) suelto(s)`);
+    showToast(`Importado: ${msg.join(', ')}${rate?` — cotización estimada: $${rate}`:''}.`);
     stmtItems = [];
     stmtTotalDebited = '';
     if(stmtMonthSelected!==currentMonth) currentMonth = stmtMonthSelected;
@@ -1745,9 +1823,9 @@ function renderTarjeta(){
 
   el.querySelectorAll('[data-del-imported]').forEach(btn=>{
     btn.onclick = ()=>{
-      const item = state.monthlyExpenses.find(m=>m.id===btn.dataset.delImported);
+      const item = (state.cardCharges||[]).find(c=>c.id===btn.dataset.delImported);
       if(item){ item.deleted = true; item.updatedAt = now(); }
-      saveKey('monthlyExpenses');
+      saveKey('cardCharges');
       renderTarjeta();
     };
   });
@@ -2123,6 +2201,7 @@ function renderConfig(){
         });
         migrateAutodebits();
         migrateExchangeRates();
+        migrateCardCharges();
         await persistForce();
         showToast('Datos restaurados.');
         render();
@@ -2135,7 +2214,7 @@ function renderConfig(){
 
   document.getElementById('cfg-reset').onclick = ()=>{
     if(!confirm('¿Seguro que querés borrar todos los datos? Esta acción no se puede deshacer.')) return;
-    state = { config: state.config, rentByMonth:{}, servicesByMonth:{}, cleaning:[], groceries:[], cardInstallments:[], cardAutodebits:[], monthlyExpenses:[], exchangeRates:{}, settlements:[] };
+    state = { config: state.config, rentByMonth:{}, servicesByMonth:{}, cleaning:[], groceries:[], cardInstallments:[], cardAutodebits:[], monthlyExpenses:[], exchangeRates:{}, settlements:[], cardCharges:[] };
     persistForce();
     showToast('Datos borrados.');
     render();
