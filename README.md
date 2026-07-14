@@ -37,7 +37,7 @@ Creá antes el repositorio vacío en GitHub (botón "New", sin agregar README pa
 Después, en el repositorio: **Settings** → **Pages** → "Build and deployment" → Source: **Deploy from a branch** → Branch: **main**, carpeta **/ (root)** → Guardar. En uno o dos minutos vas a tener la URL pública, algo como:
 
 ```
-https://TU-USUARIO.github.io/TU-REPO/
+[https://TU-USUARIO.github.io/TU-REPO/](https://myunis8.github.io/CuentasClaras/index.html)
 ```
 
 Esa es la URL que comparten vos y tu hermano.
