@@ -235,6 +235,8 @@ let stmtItems = []; // items extraídos del resumen, pendientes de revisión
 let stmtMonthSelected = currentMonth;
 let stmtTotalDebited = '';
 let stmtErrorMsg = '';
+let ghStatusHtml = '';
+let ghStatusColor = 'var(--ink-soft)';
 
 function uid(){ return 'id-' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
 function now(){ return Date.now(); }
@@ -2173,20 +2175,21 @@ function renderConfig(){
     <div class="config-block form-card">
       <h3>Sincronizar con tu hermano (GitHub)</h3>
       <p class="section-hint" style="margin-bottom:12px;">
-        Esta configuración es <strong>solo de este navegador</strong> — no se sincroniza. Cada uno la carga una vez en su propio celular/computadora, apuntando al mismo repositorio.
-        Necesitás un <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">token personal de GitHub</a> tipo "fine-grained", con acceso solo a ese repositorio y permiso "Contents: Read and write".
+        Esta configuración es <strong>solo de este navegador</strong> — no se sincroniza. Cada uno la carga una vez en su propio celular/computadora, apuntando <strong>exactamente al mismo repositorio</strong> (mismo usuario dueño, mismo nombre de repo, mismo archivo).
+        Si sos el dueño del repositorio, podés usar un <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">token fine-grained</a> con permiso "Contents: Read and write". Si solo sos colaborador (no dueño), GitHub no deja crear fine-grained para ese repo — usá un <a href="https://github.com/settings/tokens/new" target="_blank" rel="noopener">token clásico</a> con el scope <strong>repo</strong> completo tildado (imprescindible si el repositorio es privado).
       </p>
       <div class="form-row">
-        <div class="field"><label>Usuario u organización</label><input type="text" id="gh-owner" value="${escapeHtml(githubConfig?.owner||'')}" placeholder="tu-usuario"></div>
+        <div class="field"><label>Usuario dueño del repositorio</label><input type="text" id="gh-owner" value="${escapeHtml(githubConfig?.owner||'')}" placeholder="ej: nombre-de-quien-creó-el-repo"></div>
         <div class="field"><label>Repositorio</label><input type="text" id="gh-repo" value="${escapeHtml(githubConfig?.repo||'')}" placeholder="cuentas-claras"></div>
         <div class="field"><label>Archivo de datos</label><input type="text" id="gh-path" value="${escapeHtml(githubConfig?.path||'datos.json')}" placeholder="datos.json"></div>
       </div>
+      <p class="section-hint" style="margin:6px 0 0;">⚠ "Usuario dueño del repositorio" es de quién creó el repositorio en GitHub — no necesariamente tu propio usuario. Si no sos el dueño, poné el usuario del dueño igual.</p>
       <div class="form-row" style="margin-top:10px;">
-        <div class="field wide"><label>Token personal (fine-grained)</label><input type="password" id="gh-token" value="${escapeHtml(githubConfig?.token||'')}" placeholder="github_pat_..."></div>
+        <div class="field wide"><label>Token personal (fine-grained o clásico)</label><input type="password" id="gh-token" value="${escapeHtml(githubConfig?.token||'')}" placeholder="github_pat_... o ghp_..."></div>
         <div class="field small"><button class="btn" id="gh-save">Guardar y sincronizar</button></div>
         ${githubConfigured() ? `<div class="field small"><button class="btn ghost" id="gh-clear">Desconectar</button></div>` : ''}
       </div>
-      <div id="gh-status" style="margin-top:10px;font-size:13px;color:var(--ink-soft);"></div>
+      <div id="gh-status" style="margin-top:10px;font-size:13px;color:${ghStatusColor};">${ghStatusHtml}</div>
     </div>
 
     <div class="config-block form-card">
@@ -2231,32 +2234,68 @@ function renderConfig(){
     </div>
   `;
 
-  document.getElementById('gh-save').onclick = async ()=>{
+function countRecords(s){
+  const arrLen = k => Array.isArray(s[k]) ? s[k].filter(x=>!x.deleted).length : 0;
+  const mapLen = k => s[k] ? Object.keys(s[k]).filter(mk=>{
+    const v = s[k][mk];
+    return v && (Array.isArray(v) ? v.some(x=>!x.deleted) : !v.deleted);
+  }).length : 0;
+  return arrLen('cleaning') + arrLen('groceries') + arrLen('cardInstallments') + arrLen('cardAutodebits')
+    + arrLen('monthlyExpenses') + arrLen('settlements') + arrLen('cardCharges')
+    + mapLen('rentByMonth') + mapLen('servicesByMonth');
+}
+
+document.getElementById('gh-save').onclick = async ()=>{
     const owner = document.getElementById('gh-owner').value.trim();
     const repo = document.getElementById('gh-repo').value.trim();
     const path = document.getElementById('gh-path').value.trim() || 'datos.json';
     const token = document.getElementById('gh-token').value.trim();
     if(!owner || !repo || !token){ showToast('Completá usuario, repositorio y token.'); return; }
-    const statusEl = document.getElementById('gh-status');
-    statusEl.style.color = 'var(--ink-soft)';
-    statusEl.textContent = 'Probando conexión…';
+    ghStatusColor = 'var(--ink-soft)';
+    ghStatusHtml = 'Probando conexión…';
+    document.getElementById('gh-status').innerHTML = ghStatusHtml;
     saveGithubConfig({ owner, repo, path, token });
     try{
-      await syncPush(); // primer sync: si el archivo no existe, lo crea con lo que tengas cargado
-      statusEl.style.color = 'var(--accent)';
-      statusEl.textContent = '✓ Conectado y sincronizado correctamente.';
+      const { datos: remote } = await githubLeerDatos();
+      if(remote===null){
+        ghStatusColor = 'var(--accent-2)';
+        ghStatusHtml = `⚠ Se conectó a GitHub, pero no se encontró ningún archivo "${escapeHtml(path)}" en ${escapeHtml(owner)}/${escapeHtml(repo)}.<br>
+          Si tu hermano ya cargó datos ahí, revisá que el usuario, repositorio y nombre de archivo sean <strong>exactamente</strong> los mismos que usó él (mayúsculas incluidas).<br>
+          Si esta es la primera vez que alguno de los dos se conecta, tocá para crearlo: <button class="btn small" id="gh-create-file" style="margin-top:6px;">Crear archivo ahora con mis datos actuales</button>`;
+        render();
+        const createBtn = document.getElementById('gh-create-file');
+        if(createBtn) createBtn.onclick = async ()=>{
+          try{
+            await syncPushForce();
+            ghStatusColor = 'var(--accent)';
+            ghStatusHtml = '✓ Archivo creado y conectado correctamente.';
+            showToast('Conectado con GitHub.');
+          }catch(e2){
+            ghStatusColor = 'var(--danger)';
+            ghStatusHtml = 'No se pudo crear el archivo: ' + escapeHtml(e2.message||String(e2));
+          }
+          render();
+        };
+        return;
+      }
+      const remoteRecords = countRecords(remote);
+      await syncPush(); // ahora sí: hay archivo remoto, se fusiona con lo local y se guarda
+      ghStatusColor = 'var(--accent)';
+      ghStatusHtml = `✓ Conectado correctamente. Se encontraron ${remoteRecords} registro(s) ya cargados en el archivo compartido.`;
       showToast('Conectado con GitHub.');
       render();
     }catch(e){
       console.error(e);
-      statusEl.style.color = 'var(--danger)';
-      statusEl.textContent = 'No se pudo conectar: ' + (e.message||e);
+      ghStatusColor = 'var(--danger)';
+      ghStatusHtml = 'No se pudo conectar: ' + escapeHtml(e.message||String(e));
+      render();
     }
   };
   const ghClear = document.getElementById('gh-clear');
   if(ghClear) ghClear.onclick = ()=>{
     if(!confirm('¿Desconectar la sincronización en este navegador? Tus datos van a quedar guardados solo acá hasta que la vuelvas a configurar.')) return;
     clearGithubConfig();
+    ghStatusHtml = ''; ghStatusColor = 'var(--ink-soft)';
     showToast('Desconectado.');
     render();
   };
